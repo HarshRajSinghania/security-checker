@@ -21,6 +21,7 @@ BUILTIN_AGGREGATORS: dict[str, Callable[..., Aggregator]] = {
 
 
 def discover_plugin_aggregators() -> tuple[dict[str, Callable[..., Aggregator]], list[str]]:
+    """エントリーポイントからプラグイン Aggregator を発見する."""
     found: dict[str, Callable[..., Aggregator]] = {}
     warnings: list[str] = []
     for entry in entry_points(group=ENTRY_POINT_GROUP):
@@ -38,21 +39,13 @@ def build_aggregator(
 
     `weights` は Reviewer 名 → 重み。**戦略ごとの分岐を作らない**ため、
     どの戦略にも同じものを渡し、使わない戦略は受け取って無視する
-    (Provider 側で DialectOptions を全方言に渡しているのと同じ考え方)。
+    (P1: 分岐を増やさない)。
     """
-    plugins, warnings = discover_plugin_aggregators()
-    factories = {**plugins, **BUILTIN_AGGREGATORS}
-    factory = factories.get(strategy)
-    if factory is None and strategy == "judge":
-        raise ConfigError(
-            "judge は単独の Aggregator ではありません。run.review_and_aggregate を使ってください"
-        )
-    if factory is None:
-        raise ConfigError(
-            f"未知の aggregation.strategy '{strategy}'。利用可能: {', '.join(sorted(factories))}"
-        )
-    try:
-        return factory(weights=weights), warnings
-    except TypeError:
-        # weights を受け取らない実装 (外部プラグインの旧シグネチャ) も動かし続ける
-        return factory(), warnings
+    warnings: list[str] = []
+    plugins, plugin_warnings = discover_plugin_aggregators()
+    warnings.extend(plugin_warnings)
+    registry = {**BUILTIN_AGGREGATORS, **plugins}
+    if strategy not in registry:
+        available = ", ".join(sorted(registry))
+        raise ConfigError(f"不明な集約戦略 '{strategy}' です (利用可能: {available})")
+    return registry[strategy](weights=weights), warnings
