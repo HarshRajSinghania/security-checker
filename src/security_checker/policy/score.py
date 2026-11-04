@@ -45,9 +45,44 @@ def compute_score(
 ) -> Score:
     """カテゴリ毎に減点し、上限 40 で頭打ちにする.
 
-    findings があればそちらを使い、なければ candidates から仮の Finding を作る。
+    findings がある (= LLM レビュー済み) 場合は confirmed / likely のみを減点対象にする。
+    review_required は「人間の確認待ち」であり、減点として表現するのは誤りなので数えない。
     """
+    deductions: dict[str, int] = {}
+    scored: list[tuple[str, Severity]] = []
     if findings is None:
-        findings = []  # placeholder to make it valid, but I need the real function body
-    # The real function is longer. I must use the exact content.
-    return Score(value=100, rank="A", partial=False)  # temporary
+        scored = [
+            (candidate.category.value, candidate.severity_reported or Severity.INFO)
+            for candidate in candidates
+        ]
+    else:
+        scored = [
+            (finding.candidate.category.value, finding.severity)
+            for finding in findings
+            if finding.status in SCORED_STATUSES and finding.suppressed is None
+        ]
+    for key, severity in scored:
+        deductions[key] = deductions.get(key, 0) + DEDUCTION[severity]
+    capped = {key: min(value, CATEGORY_CAP) for key, value in deductions.items()}
+    value = max(0, 100 - sum(capped.values()))
+
+    incomplete = [
+        f"{run.scanner} {'未実行' if run.status is ScanStatus.SKIPPED else '失敗'}"
+        for run in runs
+        if run.status is not ScanStatus.OK
+    ]
+    # 減点されない未レビューの候補で、止まった run ほど高く見えないようにする
+    not_reviewed = sum(
+        1
+        for finding in findings or []
+        if finding.status is FindingStatus.NOT_REVIEWED and finding.suppressed is None
+    )
+    if not_reviewed:
+        incomplete.append(f"候補 {not_reviewed} 件が未レビュー")
+    return Score(
+        value=value,
+        rank=rank_for(value),
+        partial=bool(incomplete),
+        partial_reason="、".join(incomplete) if incomplete else None,
+        deductions=capped,
+    )
