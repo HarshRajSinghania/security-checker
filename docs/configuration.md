@@ -15,6 +15,9 @@
 ```
 
 - `security-checker.local.yml` は git 管理しない個人用の層です (手元でだけ使う Reviewer など)。
+  **`reviewers` だけは置き換えません。** `name` をキーに合成し、同じ名前は項目ごとに上書き、
+  新しい名前は末尾に足します。手元で共有の Reviewer を止めるには `{name: team, enabled: false}` と書きます。
+  他のリストは、ほかの層と同じく丸ごと置き換えます。
 - 環境変数は `SECURITY_CHECKER__POLICY__FAIL_ON=critical` の形 (`__` で階層を区切る)。
 - どの層で値が決まったかは `security-checker config show --explain` で見られます。
 - 未知のキーはエラーになります。打ち間違いを黙って無視しません。
@@ -56,7 +59,7 @@
 | `gitleaks.enabled` | `true` | シークレット。検出値はマスクしてから保存・送信する |
 | `osv.enabled` | `true` | 依存の既知脆弱性 (別名をまとめて 1 件にする)。osv-scanner が未導入なら `skipped` |
 | `trivy.enabled` / `scanners` | `false` / `[config]` | `config` (誤設定) / `vuln` (依存)。`secret` は受け付けない |
-| `*.timeout_s` / `extra_args` | | タイムアウトと追加引数 |
+| `*.timeout_s` / `extra_args` | | スキャナのプロセス全体の上限 (秒) と追加引数。出力の先や形式を変えるフラグは使えません (警告します) |
 
 詳細は [scanners.md](scanners.md)。
 
@@ -141,6 +144,9 @@ security-checker baseline update     # .security-checker-baseline.json を書き
 ```
 
 キーは候補の安定 ID (行番号を含まない) なので、無関係な編集では壊れません。
+秘密の候補は値のソルト付き要約も照合するので、同じ場所で値を差し替えると新しい候補になります。
+古い形式の baseline は ID だけで照合し、更新を促す警告を出します
+(判断の理由は [ADR 0008](adr/0008-baseline-secret-hash.md))。
 スキャナが失敗した run では更新を拒否します (復旧後に既存の検出が「新規」として噴き出すため)。
 
 **`.security-checker-ignore`** — パスとルールで外す。
