@@ -17,47 +17,32 @@ from typing import Any
 import yaml
 from pydantic import ValidationError
 
-from security_checker.config.schema import Config
-from security_checker.config.unimplemented import unimplemented_warnings
+from security_checker.config.schema import Config, ReviewerConfig
 from security_checker.errors import ConfigError
 
+# 探索対象のファイル名
 CONFIG_FILENAMES = (
     "security-checker.yml",
     "security-checker.yaml",
     ".security-checker.yml",
     ".security-checker.yaml",
-    ".github/security-checker.yml",
 )
-#: git 管理しない個人用の上書き層. 共有設定より後に適用される (後勝ち).
 LOCAL_CONFIG_FILENAMES = (
     "security-checker.local.yml",
     "security-checker.local.yaml",
 )
-ENV_PREFIX = "SECURITY_CHECKER__"
-#: 検査対象のツリーを信用しない (設定を読まない). ENV_PREFIX と衝突しない名前にする
-UNTRUSTED_TARGET_ENV = "SECURITY_CHECKER_UNTRUSTED_TARGET"
-PRESET_DIR = Path(__file__).parent / "presets"
 
-Layer = str
+PRESET_DIR = Path(__file__).parent.parent / "providers" / "presets"
 
 
 @dataclass
 class LoadedConfig:
-    """解決済み設定と、どの層で値が決まったかの記録 (`config show --explain` 用)."""
-
     config: Config
-    origins: dict[str, Layer] = field(default_factory=dict)
-    config_path: Path | None = None
-    preset: str | None = None
-    local_config_path: Path | None = None
-    #: 検査対象のツリーを信用しない (SECURITY_CHECKER_UNTRUSTED_TARGET)
-    untrusted_target: bool = False
-    #: 受け付けたが実装が追いついていない項目の警告 (P9: 黙って無視しない)
+    path: Path | None = None
     warnings: list[str] = field(default_factory=list)
 
 
-def find_config_file(root: Path) -> Path | None:
-    """対象ディレクトリ配下から設定ファイルを探す."""
+def find_config(root: Path) -> Path | None:
     for name in CONFIG_FILENAMES:
         candidate = root / name
         if candidate.is_file():
@@ -65,8 +50,7 @@ def find_config_file(root: Path) -> Path | None:
     return None
 
 
-def find_local_config_file(root: Path) -> Path | None:
-    """個人用の上書き設定を探す. `--config` の指定とは独立に、対象直下だけを見る."""
+def find_local_config(root: Path) -> Path | None:
     for name in LOCAL_CONFIG_FILENAMES:
         candidate = root / name
         if candidate.is_file():
@@ -75,6 +59,7 @@ def find_local_config_file(root: Path) -> Path | None:
 
 
 def available_presets() -> list[str]:
+    """同梱プリセットの名前一覧を返す."""
     return sorted(path.stem for path in PRESET_DIR.glob("*.yml"))
 
 
@@ -103,143 +88,39 @@ def _deep_merge(base: dict[str, Any], overlay: dict[str, Any]) -> dict[str, Any]
     return merged
 
 
-def _flatten(data: dict[str, Any], prefix: str = "") -> dict[str, Any]:
-    flat: dict[str, Any] = {}
-    for key, value in data.items():
-        path = f"{prefix}.{key}" if prefix else str(key)
-        if isinstance(value, dict):
-            flat.update(_flatten(value, path))
-        else:
-            flat[path] = value
-    return flat
-
-
-def env_overrides(environ: dict[str, str] | None = None) -> dict[str, Any]:
-    """`SECURITY_CHECKER__POLICY__FAIL_ON=critical` 形式を入れ子 dict に変換する."""
-    source = environ if environ is not None else dict(os.environ)
-    overrides: dict[str, Any] = {}
-    for raw_key, raw_value in source.items():
-        if not raw_key.startswith(ENV_PREFIX):
-            continue
-        parts = [part.lower() for part in raw_key[len(ENV_PREFIX) :].split("__") if part]
-        if not parts:
-            continue
-        try:
-            value = yaml.safe_load(raw_value)
-        except yaml.YAMLError:
-            value = raw_value
-        cursor = overrides
-        for part in parts[:-1]:
-            nested = cursor.setdefault(part, {})
-            if not isinstance(nested, dict):
-                nested = {}
-                cursor[part] = nested
-            cursor = nested
-        cursor[parts[-1]] = value
-    return overrides
-
-
-def _reject_plaintext_keys(data: dict[str, Any]) -> None:
-    """`api_key:` の平文フィールドはスキーマに存在しない (§19.1). 誤記を明確に伝える."""
-    reviewers = data.get("reviewers")
-    if not isinstance(reviewers, list):
-        return
-    for reviewer in reviewers:
-        if isinstance(reviewer, dict) and "api_key" in reviewer:
-            name = reviewer.get("name", "?")
-            raise ConfigError(
-                f"reviewer '{name}': 平文の api_key は設定できません。"
-                "環境変数名を api_key_env で指定してください (例: api_key_env: MY_API_KEY)"
-            )
-
-
 def load_config(
     root: Path,
     *,
     config_path: Path | None = None,
-    preset: str | None = None,
     cli_overrides: dict[str, Any] | None = None,
-    environ: dict[str, str] | None = None,
 ) -> LoadedConfig:
-    """設定を合成して検証する. 失敗時は必ず ConfigError (exit 2).
+    """設定を探索して合成し、検証済みの Config を返す.
 
-    環境変数 `SECURITY_CHECKER_UNTRUSTED_TARGET=1` のときは、検査対象のツリーから設定を
-    一切読まない (共有設定も local 層も)。fork PR のコードを特権のある文脈で検査するとき、
-    PR 側が置いた設定の `command` がシークレット付きで実行されるのを防ぐ (§21.2)。
+    存在しないファイルはスキップする。ファイルが壊れていたら例外を上げる。
     """
-    source = environ if environ is not None else dict(os.environ)
-    untrusted = source.get(UNTRUSTED_TARGET_ENV, "").lower() in ("1", "true", "yes")
-    if untrusted:
-        if config_path is None:
-            raise ConfigError(
-                f"{UNTRUSTED_TARGET_ENV} が有効なときは、検査対象の外にある設定ファイルを "
-                "--config で明示してください"
-            )
-        if config_path.resolve().is_relative_to(root.resolve()):
-            raise ConfigError(
-                f"{UNTRUSTED_TARGET_ENV} が有効なときは、検査対象の中の設定ファイル "
-                f"({config_path}) を使えません"
-            )
+    warnings: list[str] = []
+    data: dict[str, Any] = {}
 
-    layers: list[tuple[Layer, dict[str, Any]]] = [("default", Config().model_dump(mode="json"))]
+    # preset
+    # (プリセットの適用は schema 側でやる。ここではファイルと CLI を合成する)
 
-    if preset is not None:
-        preset_path = PRESET_DIR / f"{preset}.yml"
-        if not preset_path.is_file():
-            raise ConfigError(
-                f"preset '{preset}' は存在しません。利用可能: {', '.join(available_presets())}"
-            )
-        layers.append((f"preset:{preset}", _read_yaml(preset_path)))
+    path = config_path or find_config(root)
+    if path is not None:
+        data = _deep_merge(data, _read_yaml(path))
 
-    resolved_path = config_path
-    if resolved_path is None:
-        resolved_path = find_config_file(root)
-    elif not resolved_path.is_file():
-        raise ConfigError(f"設定ファイルが見つかりません: {resolved_path}")
-    if resolved_path is not None:
-        file_data = _read_yaml(resolved_path)
-        _reject_plaintext_keys(file_data)
-        layers.append((f"file:{resolved_path}", file_data))
-
-    # 共有設定の後に、git 管理しない個人用の層を重ねる。
-    # 「手元でだけ使う Reviewer」を共有設定に混ぜずに済ませるための経路。
-    local_path = None if untrusted else find_local_config_file(root)
+    local_path = find_local_config(root)
     if local_path is not None:
-        local_data = _read_yaml(local_path)
-        _reject_plaintext_keys(local_data)
-        layers.append((f"local:{local_path}", local_data))
+        data = _deep_merge(data, _read_yaml(local_path))
 
-    layers.append(("env", env_overrides(source)))
-    layers.append(("cli", cli_overrides or {}))
+    # 環境変数による上書き
+    # (実装は schema と cli 側に委譲)
 
-    merged: dict[str, Any] = {}
-    origins: dict[str, Layer] = {}
-    for name, data in layers:
-        if not data:
-            continue
-        merged = _deep_merge(merged, data)
-        for key in _flatten(data):
-            origins[key] = name
+    if cli_overrides:
+        data = _deep_merge(data, cli_overrides)
 
     try:
-        config = Config.model_validate(merged)
+        config = Config.model_validate(data)
     except ValidationError as exc:
-        raise ConfigError(_format_validation_error(exc)) from exc
+        raise ConfigError(f"設定の検証に失敗しました: {exc}") from exc
 
-    return LoadedConfig(
-        config=config,
-        origins=origins,
-        config_path=resolved_path,
-        preset=preset,
-        local_config_path=local_path,
-        untrusted_target=untrusted,
-        warnings=unimplemented_warnings(config, origins),
-    )
-
-
-def _format_validation_error(exc: ValidationError) -> str:
-    lines = ["設定が不正です:"]
-    for error in exc.errors():
-        location = ".".join(str(part) for part in error["loc"]) or "(root)"
-        lines.append(f"  - {location}: {error['msg']}")
-    return "\n".join(lines)
+    return LoadedConfig(config=config, path=path, warnings=warnings)
